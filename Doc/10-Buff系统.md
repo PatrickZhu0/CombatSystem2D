@@ -956,71 +956,626 @@ query.Free();  // 释放回对象池
 
 ---
 
-## 七、完整 Buff 流程
+## 七、Buff 添加与移除详解
 
-### 7.1 Buff 创建与添加
+### 7.1 Buff 添加完整流程
 
-```
-技能释放/物品使用/装备穿戴
-    ↓
-加载 AppendageScript 配置
-    ↓
-AppendageFactory.CreateAppendageByScript(script)
-    ↓
-创建 IRDAppendage 子类实例
-    ↓
-设置参数（duration, isBuff, 特效等）
-    ↓
-IRDAppendage.Append(parent, source, isBuff, id, overlapMax, master)
-    ↓
-CNRDAppendageManager.addAppendage(appendage, master, overlapCount)
-    ↓
-检查叠加限制
-    ↓
-添加到 vectorAppendages_ 列表
-    ↓
-OnStart() 回调
-    ↓
-procStatus() 应用属性变更
-```
-
-### 7.2 Buff 更新循环
+#### 添加链路图
 
 ```
-每帧更新：
-    preProc(deltaTime)
-        └── PrepareDraw() 绘制准备
+┌─────────────────────────────────────────────────────────────┐
+│                     Buff 添加流程                            │
+└─────────────────────────────────────────────────────────────┘
+
+  ┌─────────────┐
+  │ 技能释放    │
+  │ 物品使用    │
+  │ 装备穿戴    │
+  └──────┬──────┘
+         ↓
+  ┌─────────────────────────┐
+  │ AppendageScript 配置     │
+  │ - duration (持续时间)    │
+  │ - isBuff (Buff/Debuff)   │
+  │ - maxOverlap (最大叠加)  │
+  │ - effectAni (特效)       │
+  └──────────┬──────────────┘
+             ↓
+  ┌─────────────────────────┐
+  │ AppendageFactory        │
+  │ CreateAppendageByScript │
+  └──────────┬──────────────┘
+             ↓
+  ┌─────────────────────────┐
+  │ 创建 IRDAppendage 子类   │
+  │ - CNChangeStatus        │
+  │ - ChangeHp              │
+  │ - CNAuraMaster          │
+  └──────────┬──────────────┘
+             ↓
+  ┌─────────────────────────┐
+  │ IRDAppendage.Append()   │
+  │ ├─ CheckScoreCondition  │
+  │ └─ AppendAppendage      │
+  └──────────┬──────────────┘
+             ↓
+  ┌─────────────────────────┐
+  │ ValidationOverlapNormal │
+  │ ├─ 检查叠加限制          │
+  │ ├─ 续Buff 或 覆盖        │
+  │ └─ 移除旧的 Buff         │
+  └──────────┬──────────────┘
+             ↓
+  ┌─────────────────────────┐
+  │ CNRDAppendageManager    │
+  │ addAppendage()          │
+  │ ├─ isExistAppendage     │
+  │ ├─ isAppendable         │
+  │ └─ vectorAppendages_.Add│
+  └──────────┬──────────────┘
+             ↓
+  ┌─────────────────────────┐
+  │ OnStart() 生命周期       │
+  │ ├─ 播放开始特效          │
+  │ ├─ procStatus()         │
+  │ │   应用属性变更         │
+  │ └─ 启动定时事件          │
+  └─────────────────────────┘
+```
+
+#### Append() 方法详解（line 412315）
+
+```csharp
+public virtual Boolean Append(
+    IRDActiveObject parent,           // 目标角色
+    IRDCollisionObject source,        // 来源对象（施法者）
+    Boolean isBuff,                   // true=Buff, false=Debuff
+    ENUM_APPENDAGE_ID id,             // Buff ID
+    Int32 customOverlapMax,           // 自定义最大叠加数
+    IRDAppendage master)              // 主 Buff（光环用）
+{
+    // 1. 评分条件检查（某些 Buff 有职业限制等）
+    if (!CheckScoreCondition()) 
+        return false;
     
-    mainProc(deltaTime)
-        └── Proc() 每帧逻辑
-        └── Signal() 时间检查
-        └── 到期则 RemoveAppendage()
+    // 2. 调用内部添加方法
+    return AppendAppendage(parent, source, isBuff, id, customOverlapMax, master);
+}
+
+private Boolean AppendAppendage(...)
+{
+    // 1. 覆盖规则验证
+    ValidationOverlapNormal(parent, id, customOverlapMax);
     
-    postProc(deltaTime)
-        └── DrawAppend() 绘制特效
+    // 2. 设置父对象和来源
+    this.parent = parent;
+    this.source = source;
+    this.isBuff_ = isBuff;
+    this.id_ = id;
     
-    procStatus(activeStaticInfo)
-        └── 应用属性到 ActiveStaticInfo
+    // 3. 获取角色的 Buff 管理器
+    var manager = parent.GetAppendageManager();
+    
+    // 4. 添加到管理器
+    if (!manager.addAppendage(this, master, customOverlapMax))
+        return false;
+    
+    // 5. 调用 OnStart 生命周期
+    OnStart();
+    
+    return true;
+}
 ```
 
-### 7.3 Buff 移除
+#### 覆盖规则验证（line 412325）
+
+```csharp
+private void ValidationOverlapNormal(
+    IRDActiveObject parent, 
+    ENUM_APPENDAGE_ID id, 
+    Int32 customOverlapMax)
+{
+    var manager = parent.GetAppendageManager();
+    
+    // 检查是否可添加（叠加数限制）
+    if (!manager.isAppendable(id, customOverlapMax))
+    {
+        // 已达最大叠加数
+        // 根据配置决定：覆盖旧的 或 拒绝新的
+        
+        // 查找同 ID 的 Buff
+        var existing = manager.GetAppendageFromIDFirst(id);
+        
+        if (existing != null && isRenewalAppendage_)
+        {
+            // 续 Buff：刷新时间
+            existing.addValidTime(this.endTimer_);
+        }
+        else
+        {
+            // 覆盖：移除旧的
+            manager.RemoveAppendageFromID(id, source);
+        }
+    }
+}
+```
+
+#### addAppendage() 详解（line 403386）
+
+```csharp
+public Boolean addAppendage(
+    IRDAppendage appendage, 
+    IRDAppendage master, 
+    Int32 customOverlapCount)
+{
+    // 1. 检查是否已存在（同一实例）
+    if (isExistAppendage(appendage))
+    {
+        // 刷新时间
+        appendage.addValidTime(appendage.endTimer_);
+        return true;
+    }
+    
+    // 2. 检查叠加限制
+    if (!isAppendable(appendage.id_, customOverlapCount))
+    {
+        return false;
+    }
+    
+    // 3. 添加到列表
+    vectorAppendages_.Add(appendage);
+    
+    // 4. 如果是主 Buff，注册到映射
+    if (master == null)
+    {
+        appendageMasters_[appendage.id_] = appendage;
+    }
+    
+    // 5. 特殊计数更新
+    if (appendage.IsInvincible)
+    {
+        invincibleAppendageCnt++;
+    }
+    
+    return true;
+}
+
+// 叠加数检查
+public Boolean isAppendable(ENUM_APPENDAGE_ID id, Int32 customOverlapCount)
+{
+    int max = customOverlapCount > 0 
+            ? customOverlapCount 
+            : getOverlapMaxCount(id);
+    
+    return getAppendageCount(id) < max;
+}
+
+// 获取当前叠加数
+public Int32 getAppendageCount(ENUM_APPENDAGE_ID id)
+{
+    int count = 0;
+    foreach (var ap in vectorAppendages_)
+    {
+        if (ap.id_ == id) count++;
+    }
+    return count;
+}
+```
+
+---
+
+### 7.2 Buff 移除完整流程
+
+#### 移除触发条件
+
+| 触发条件 | 调用方法 |
+|---------|---------|
+| 时间到期 | mainProc() 中检测 endTimer_ <= 0 |
+| 手动移除 | RemoveAppendage() / RemoveAppendageFromID() |
+| 角色死亡 | onDieParent() → RemoveAllAppedages() |
+| 来源离开 | isAutoReleaseAfterSourceLeave 触发 |
+| 受击次数 | remainDestroyHitCount_ 耗尽 |
+| 攻击次数 | remainDestroyAttackCount_ 耗尽 |
+| 被驱散 | RemoveAllDebuffs() 等 |
+
+#### 移除流程图
 
 ```
-时间到期 / 手动移除 / 来源离开
-    ↓
-CNRDAppendageManager.RemoveAppendage(index)
-    ↓
-IRDAppendage.OnEnd(onReleaseParent)
-    ↓
-procStatusInvalidAppendage() 撤销属性变更
-    ↓
-播放结束特效
-    ↓
-clear() 清理资源
-    ↓
-从 vectorAppendages_ 移除
-    ↓
-从 appendageMasters_ 移除
+┌─────────────────────────────────────────────────────────────┐
+│                     Buff 移除流程                            │
+└─────────────────────────────────────────────────────────────┘
+
+  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+  │ 时间到期    │  │ 手动移除    │  │ 角色死亡    │
+  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
+         │                │                │
+         └────────────────┴────────────────┘
+                          ↓
+  ┌─────────────────────────────────────────┐
+  │ CNRDAppendageManager                    │
+  │ RemoveAppendage(index)                  │
+  └──────────────────────┬──────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────┐
+  │ IRDAppendage.OnEnd(false)               │
+  │ ├─ procStatusInvalidAppendage()         │
+  │ │   撤销属性变更                         │
+  │ ├─ removeCallback()                     │
+  │ ├─ 播放结束特效                          │
+  │ └─ clear() 清理资源                      │
+  └──────────────────────┬──────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────┐
+  │ 从 vectorAppendages_ 移除               │
+  │ 从 appendageMasters_ 移除               │
+  │ 更新 invincibleAppendageCnt            │
+  └─────────────────────────────────────────┘
+```
+
+#### 移除方法详解
+
+**通过索引移除（line 403412）**
+
+```csharp
+public void RemoveAppendage(Int32 index)
+{
+    if (index < 0 || index >= vectorAppendages_.Count) 
+        return;
+    
+    IRDAppendage appendage = vectorAppendages_[index];
+    
+    // 1. 调用结束生命周期
+    appendage.OnEnd(false);
+    
+    // 2. 更新特殊计数
+    if (appendage.IsInvincible)
+    {
+        invincibleAppendageCnt--;
+    }
+    
+    // 3. 从列表移除
+    vectorAppendages_.RemoveAt(index);
+    
+    // 4. 从主 Buff 映射移除
+    if (appendageMasters_.ContainsKey(appendage.id_) &&
+        appendageMasters_[appendage.id_] == appendage)
+    {
+        appendageMasters_.Remove(appendage.id_);
+    }
+}
+```
+
+**通过实例移除（line 403414）**
+
+```csharp
+public void RemoveAppendage(IRDAppendage appendage)
+{
+    int index = vectorAppendages_.IndexOf(appendage);
+    if (index >= 0)
+    {
+        RemoveAppendage(index);
+    }
+}
+```
+
+**通过 ID 移除所有（line 403418）**
+
+```csharp
+public void RemoveAppendageFromID(ENUM_APPENDAGE_ID id, IRDCollisionObject source)
+{
+    for (int i = vectorAppendages_.Count - 1; i >= 0; i--)
+    {
+        if (vectorAppendages_[i].id_ == id)
+        {
+            // 检查来源是否匹配（可选）
+            if (source == null || vectorAppendages_[i].source == source)
+            {
+                RemoveAppendage(i);
+            }
+        }
+    }
+}
+```
+
+**移除所有 Buff（line 403408）**
+
+```csharp
+public void RemoveAllAppedages(Boolean isRelease)
+{
+    // 倒序遍历，避免索引问题
+    for (int i = vectorAppendages_.Count - 1; i >= 0; i--)
+    {
+        vectorAppendages_[i].OnEnd(isRelease);
+    }
+    
+    vectorAppendages_.Clear();
+    appendageMasters_.Clear();
+    invincibleAppendageCnt = 0;
+}
+```
+
+**使所有 Buff 失效（line 403406）**
+
+```csharp
+public void OffAllAppendagesValid()
+{
+    // 不调用 OnEnd，只是标记为无效
+    // 后续 mainProc 会自动移除
+    foreach (var ap in vectorAppendages_)
+    {
+        ap.IsValid = false;
+    }
+}
+```
+
+#### OnEnd() 生命周期（line 412291）
+
+```csharp
+public virtual void OnEnd(Boolean onReleaseParent)
+{
+    // 1. 撤销属性变更
+    procStatusInvalidAppendage();
+    
+    // 2. 移除回调
+    removeCallback(onReleaseParent);
+    
+    // 3. 播放结束特效
+    if (appendageEndEffectAni_ != null && IsEnableRenderer)
+    {
+        // 创建结束特效
+        CreateEffect(appendageEndEffectAni_);
+    }
+    
+    // 4. 清理资源
+    clear();
+}
+```
+
+#### 属性撤销（line 412347）
+
+```csharp
+public virtual void procStatusInvalidAppendage()
+{
+    // 基类空实现
+    // CNChangeStatus 子类重写，反向应用属性变更
+}
+
+// CNChangeStatus 中的实现
+public override void procStatusInvalidAppendage()
+{
+    foreach (var data in changeStatusDatas_)
+    {
+        // 取负值撤销
+        activeStaticInfo.updateActiveStaticInfo(
+            data.statusType_,
+            data.isRateChange_,
+            -data.changeValue_,  // 注意：取负值
+            parent);
+    }
+}
+```
+
+---
+
+### 7.3 时间到期自动移除
+
+#### mainProc 中的检测（line 403384）
+
+```csharp
+public void mainProc(Single procDeltaTime)
+{
+    // 倒序遍历，安全移除
+    for (int i = vectorAppendages_.Count - 1; i >= 0; i--)
+    {
+        var ap = vectorAppendages_[i];
+        
+        // 1. 检查有效性
+        if (!ap.IsValid)
+        {
+            RemoveAppendage(i);
+            continue;
+        }
+        
+        // 2. 暂停检查
+        if (ap.isPause())
+            continue;
+        
+        // 3. 执行每帧逻辑
+        ap.Proc(procDeltaTime);
+        
+        // 4. 时间到期检查
+        if (ap.endTimer_ > 0)  // -1 表示永久
+        {
+            Single remaining = ap.Signal(procDeltaTime);
+            if (remaining <= 0)
+            {
+                // 时间到期，移除
+                RemoveAppendage(i);
+            }
+        }
+    }
+}
+```
+
+#### Signal 方法（时间递减）
+
+```csharp
+// IRDAppendage 中
+public Single Signal(Single term)
+{
+    if (endTimer_ < 0) 
+        return endTimer_;  // 永久 Buff 不递减
+    
+    endTimer_ -= term;
+    return endTimer_;
+}
+
+public Single getTimer() 
+{ 
+    return endTimer_; 
+}
+
+public Single getRemainTime() 
+{ 
+    return endTimer_; 
+}
+```
+
+---
+
+### 7.4 特殊移除条件
+
+#### 受击/攻击次数销毁
+
+```csharp
+// IRDAppendage 中
+private Int32 remainDestroyHitCount_;     // 受击次数
+private Int32 remainDestroyAttackCount_;  // 攻击次数
+
+public void setDestroyHitCount(Int32 pCount)
+{
+    remainDestroyHitCount_ = pCount;
+}
+
+public void setDestroyAttackCount(Int32 pCount)
+{
+    remainDestroyAttackCount_ = pCount;
+}
+
+// 在受击时检查
+public virtual void onDamageParent(IRDCollisionObject attacker, Boolean isStuck)
+{
+    if (remainDestroyHitCount_ > 0)
+    {
+        remainDestroyHitCount_--;
+        if (remainDestroyHitCount_ <= 0)
+        {
+            IsValid = false;  // 标记待移除
+        }
+    }
+}
+
+// 在攻击时检查
+public virtual void onAttackParent(IRDCollisionObject realAttacker, IRDCollisionObject damager, Boolean isStuck)
+{
+    if (remainDestroyAttackCount_ > 0)
+    {
+        remainDestroyAttackCount_--;
+        if (remainDestroyAttackCount_ <= 0)
+        {
+            IsValid = false;
+        }
+    }
+}
+```
+
+#### 来源离开自动释放
+
+```csharp
+// IRDAppendage 中
+protected Boolean isAutoReleaseAfterSourceLeave;
+
+// 当来源对象离开场景时
+public void CheckSourceLeave()
+{
+    if (isAutoReleaseAfterSourceLeave && source != null)
+    {
+        if (!source.IsActive || source.IsDead)
+        {
+            IsValid = false;
+        }
+    }
+}
+```
+
+---
+
+### 7.5 每帧更新循环
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Buff 每帧更新                              │
+└─────────────────────────────────────────────────────────────┘
+
+  preProc(deltaTime)
+      │
+      ├── PrepareDraw() 绘制准备
+      │
+      ↓
+  mainProc(deltaTime)
+      │
+      ├── 倒序遍历 vectorAppendages_
+      │   │
+      │   ├── 检查 IsValid
+      │   │   └── false → RemoveAppendage(i)
+      │   │
+      │   ├── 检查 isPause
+      │   │   └── true → 跳过
+      │   │
+      │   ├── Proc(deltaTime)
+      │   │   └── 执行每帧逻辑
+      │   │
+      │   └── Signal(deltaTime)
+      │       └── endTimer_ <= 0 → RemoveAppendage(i)
+      │
+      ↓
+  postProc(deltaTime)
+      │
+      └── DrawAppend() 绘制特效
+```
+
+---
+
+### 7.6 代码示例
+
+#### 添加 Buff 示例
+
+```csharp
+// 1. 加载配置
+var script = AppendageScript.ImportScript(buffIndex);
+
+// 2. 创建 Buff
+var buff = AppendageFactory.CreateAppendageByScript(script);
+
+// 3. 设置参数（属性变更 Buff）
+var changeStatus = buff as CNChangeStatus;
+changeStatus.addParameter(ENUM_CHANGE_STATUS_TYPE.CHANGE_STATUS_TYPE_PHYSICAL_ATTACK, 
+                          false, 100, buff.UniqueId);  // +100 物攻
+changeStatus.addParameter(ENUM_CHANGE_STATUS_TYPE.CHANGE_STATUS_TYPE_ATTACK_SPEED, 
+                          true, 0.2f, buff.UniqueId);   // +20% 攻速
+
+// 4. 添加到角色
+buff.Append(targetCharacter, sourceCharacter, true, 
+             ENUM_APPENDAGE_ID.POWER_UP, 1, null);
+```
+
+#### 移除 Buff 示例
+
+```csharp
+// 通过 ID 移除
+targetCharacter.GetAppendageManager()
+    .RemoveAppendageFromID(ENUM_APPENDAGE_ID.POWER_UP, null);
+
+// 通过技能 ID 移除
+var query = targetCharacter.GetAppendageManager()
+    .GetAppendageFromSkillIdx(skillIndex);
+foreach (var ap in query)
+{
+    targetCharacter.GetAppendageManager().RemoveAppendage(ap);
+}
+query.Free();
+
+// 移除所有 Debuff
+var manager = targetCharacter.GetAppendageManager();
+var debuffs = manager.getAppendageFromType(ENUM_APPENDAGE_TYPE.AP_TYPE_CHANGE_STATUS);
+foreach (var ap in debuffs)
+{
+    if (!ap.isBuff())
+    {
+        manager.RemoveAppendage(ap);
+    }
+}
+debuffs.Free();
 ```
 
 ---
