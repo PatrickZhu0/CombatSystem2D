@@ -40,20 +40,5 @@
     "com.unity.modules.wind": "1.0.0",
     "com.unity.modules.xr": "1.0.0"
   },
-  "scopedRegistries": [
-    {
-      "name": "Unity-proxy",
-      "url": "http://10.235.200.95:8081/repository/npm-unity",
-      "scopes": [
-        "com.unity"
-      ]
-    },
-    {
-      "name": "package.openupm.com",
-      "url": "http://10.235.200.95:8081/repository/npmproxy_unity",
-      "scopes": [
-        "com.tuyoogame"
-      ]
-    }
-  ]
+  "scopedRegistries": []
 }
